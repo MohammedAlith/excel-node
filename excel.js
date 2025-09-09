@@ -14,7 +14,7 @@ const app = express();
 const PORT = process.env.PORT || 8000;
 
 app.use(cors({
-  origin: ["http://localhost:3000","https://excel-front-navy.vercel.app"],
+  origin: ["http://localhost:3000", "https://excel-front-navy.vercel.app"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
@@ -22,6 +22,7 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// --- Upload Setup ---
 const uploadPath = path.join(process.cwd(), "uploads");
 if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
 app.use("/uploads", express.static(uploadPath));
@@ -37,6 +38,7 @@ const getClient = () => new Client({
   ssl: { rejectUnauthorized: false }
 });
 
+// --- Home ---
 app.get("/", (req, res) => res.send("Backend is running!"));
 
 // --- Upload Excel ---
@@ -47,7 +49,7 @@ app.post("/upload", upload.single("excel"), async (req, res) => {
   const rows = await readXlsxFile(req.file.path);
   if (rows.length < 2) return res.status(400).send("Excel has no data");
 
-  const headers = rows[0];
+  const headers = rows[0]; // Keep all columns including Excel's ID
   const dataRows = rows.slice(1);
 
   if (!tableName) tableName = path.parse(req.file.originalname).name;
@@ -56,43 +58,54 @@ app.post("/upload", upload.single("excel"), async (req, res) => {
   await client.connect();
 
   try {
-    // Ensure ID column exists
-    const hasID = headers.includes("ID");
-    if (!hasID) headers.unshift("ID"); // add ID column
-    const columnsSQL = headers.map(h => `"${h}" TEXT`).join(", ");
-    const createSQL = `CREATE TABLE IF NOT EXISTS "${tableName}" (${columnsSQL})`;
-    await client.query(createSQL);
+    // Check existing columns
+    const tableCheck = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
+      [tableName]
+    );
+    const existingColumns = tableCheck.rows.map(r => r.column_name);
 
-    for (let i = 0; i < dataRows.length; i++) {
-      const row = dataRows[i];
-      const values = hasID ? row : [i + 1, ...row]; // add ID if missing
-      const placeholders = values.map((_, idx) => `$${idx + 1}`).join(", ");
-      const insertSQL = `INSERT INTO "${tableName}" (${headers.map(h => `"${h}"`).join(", ")}) VALUES (${placeholders})`;
-      await client.query(insertSQL, values);
+    // Ensure consistent lowercase id column: table_id
+    const idColumnName = "table_id";
+
+    if (tableCheck.rows.length === 0) {
+      // Table does not exist — create with table_id
+      const columnsSQL = headers.map(h => `"${h}" TEXT`).join(", ");
+      const createSQL = `
+        CREATE TABLE "${tableName}" (
+          "${idColumnName}" SERIAL PRIMARY KEY,
+          ${columnsSQL}
+        )
+      `;
+      await client.query(createSQL);
+    } else if (!existingColumns.includes(idColumnName)) {
+      // Table exists but no table_id — add it
+      await client.query(`ALTER TABLE "${tableName}" ADD COLUMN "${idColumnName}" SERIAL PRIMARY KEY`);
     }
 
-    res.json({
-      message: "Excel inserted successfully",
-      table: tableName,
-      inserted: dataRows.length
-    });
+    // Insert rows (skip table_id)
+    for (let row of dataRows) {
+      const placeholders = headers.map((_, idx) => `$${idx + 1}`).join(", ");
+      const insertSQL = `INSERT INTO "${tableName}" (${headers.map(h => `"${h}"`).join(", ")}) VALUES (${placeholders})`;
+      await client.query(insertSQL, row);
+    }
+
+    res.json({ message: "Excel inserted successfully", table: tableName, inserted: dataRows.length });
   } catch (err) {
     console.error("Upload Error:", err);
     res.status(500).send("Error: " + err.message);
-  } finally { await client.end(); }
+  } finally {
+    await client.end();
+  }
 });
 
-// --- Get all tables ---
+// --- List Tables ---
 app.get("/tables", async (req, res) => {
   const client = getClient();
   await client.connect();
   try {
-    const result = await client.query(`
-      SELECT table_name
-      FROM information_schema.tables
-      WHERE table_schema='public'
-      ORDER BY table_name
-    `);
+    const result = await client.query(`SELECT table_name FROM information_schema.tables 
+      WHERE table_schema='public'`);
     res.json(result.rows.map(r => r.table_name));
   } catch (err) {
     console.error("DB Error:", err);
@@ -100,7 +113,7 @@ app.get("/tables", async (req, res) => {
   } finally { await client.end(); }
 });
 
-// --- Get paginated data safely ---
+// --- Get Paginated Data ---
 app.get("/data/:table", async (req, res) => {
   const { table } = req.params;
   const page = parseInt(req.query.page ) || 1;
@@ -111,25 +124,20 @@ app.get("/data/:table", async (req, res) => {
   await client.connect();
 
   try {
-    // Check if ID column exists
-    const idCheck = await client.query(
-      `SELECT column_name 
-       FROM information_schema.columns 
-       WHERE table_name = $1 AND column_name='ID'`,
+    // Detect ID column dynamically
+    const colResult = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name ILIKE '%id%' ORDER BY ordinal_position LIMIT 1`,
       [table]
     );
-    const hasID = idCheck.rows.length > 0;
+    if (colResult.rows.length === 0)
+      return res.status(400).json({ error: "No ID column found in table" });
+    const idColumn = colResult.rows[0].column_name;
 
-    // Count total rows
     const totalResult = await client.query(`SELECT COUNT(*) FROM "${table}"`);
     const totalRows = parseInt(totalResult.rows[0].count);
 
-    // Fetch data
-    const orderBy = hasID ? `"ID"` : null;
     const result = await client.query(
-      orderBy
-        ? `SELECT * FROM "${table}" ORDER BY "ID"::int LIMIT $1 OFFSET $2`
-        : `SELECT * FROM "${table}" LIMIT $1 OFFSET $2`,
+      `SELECT * FROM "${table}" ORDER BY "${idColumn}" LIMIT $1 OFFSET $2`,
       [limit, offset]
     );
 
@@ -146,7 +154,7 @@ app.get("/data/:table", async (req, res) => {
   } finally { await client.end(); }
 });
 
-// --- Delete table ---
+// --- Delete Table ---
 app.delete("/table/:name", async (req, res) => {
   const { name } = req.params;
   const client = getClient();
@@ -160,7 +168,7 @@ app.delete("/table/:name", async (req, res) => {
   } finally { await client.end(); }
 });
 
-// --- Export table as Excel ---
+// --- Export Table ---
 app.get("/table/:table", async (req, res) => {
   const { table } = req.params;
   const client = getClient();
@@ -187,7 +195,7 @@ app.get("/table/:table", async (req, res) => {
   } finally { await client.end(); }
 });
 
-// --- Update row ---
+// --- Update Row ---
 app.put("/data/:table/:id", async (req, res) => {
   const { table, id } = req.params;
   const updates = req.body;
@@ -195,25 +203,38 @@ app.put("/data/:table/:id", async (req, res) => {
   await client.connect();
 
   try {
-    if (!updates || Object.keys(updates).length === 0)
-      return res.status(400).json({ error: "No fields provided for update" });
+    // Validate ID
+    if (!id || isNaN(Number(id))) {
+      return res.status(400).json({ error: "Invalid or missing row ID" });
+    }
 
+    if (!updates || Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: "No fields provided for update" });
+    }
+
+    // Build SET clause
     const setClause = Object.keys(updates)
       .map((col, i) => `"${col}" = $${i + 1}`)
       .join(", ");
     const values = Object.values(updates);
-    const sql = `UPDATE "${table}" SET ${setClause} WHERE "ID" = $${values.length + 1} RETURNING *`;
 
-    const result = await client.query(sql, [...values, id]);
+    // Add id at the end
+    values.push(Number(id));
 
-    if (result.rowCount === 0)
-      return res.status(404).json({ error: `Row with ID=${id} not found` });
+    const sql = `UPDATE "${table}" SET ${setClause} WHERE table_id = $${values.length} RETURNING *;`;
+    const result = await client.query(sql, values);
 
-    res.json({ message: `Row updated`, row: result.rows[0] });
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: `Row with table_id=${id} not found` });
+    }
+
+    res.json({ message: "Row updated", row: result.rows[0] });
   } catch (err) {
     console.error("Update Error:", err);
     res.status(500).json({ error: err.message });
-  } finally { await client.end(); }
+  } finally {
+    await client.end();
+  }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
